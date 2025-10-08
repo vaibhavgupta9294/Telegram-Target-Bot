@@ -1,6 +1,4 @@
-python-telegram-bot==20.0
-APScheduler
-Flask
-pytz
-psycopg2-binary
-gunicorn
+python-telegram-bot==20.3
+apscheduler==3.10.4
+psycopg2-binary==2.9.9
+pytz==2024.1

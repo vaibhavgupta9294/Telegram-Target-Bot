@@ -1,4 +1,3 @@
-# main.py
 import os
 import logging
 import asyncio
@@ -6,9 +5,10 @@ from datetime import datetime, date, time, timedelta
 import pytz
 import psycopg2
 from psycopg2.extras import RealDictCursor
+# Changed scheduler import to AsyncIOScheduler
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram import Update
-from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler # Changed from BackgroundScheduler
 
 # ------------------------
 # 1. Environment / Config
@@ -26,6 +26,13 @@ try:
     THREAD_ID = int(os.getenv("THREAD_ID")) if os.getenv("THREAD_ID") else None
 except (TypeError, ValueError):
     THREAD_ID = None
+
+# --- Render/Webhook Specific Config ---
+# Render requires binding to the PORT environment variable
+PORT = int(os.environ.get("PORT", "8080")) 
+# This should be set in Render envs (e.g., https://<service-name>.onrender.com/)
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") 
+WEBHOOK_PATH = "/"
 
 # global app reference used by scheduled jobs to send messages
 telegram_bot_app = None
@@ -314,7 +321,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         pts = m['points'] or 0
         streak = m['streak'] or 0
         response += f"{idx}. @{username} — {pts} pts | 🔥 Streak: {streak} | {status}\n"
-    await update.message.reply_text(response)
+    await update.message.reply_text(response, parse_mode='Markdown') # Added parse_mode
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Mark user as done via /done command (usable in group)."""
@@ -373,9 +380,11 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("⚠️ Proof ke liye caption mein 'today target completed' likhein (ya /done use karein).")
     else:
         # outside submission windows
-        await update.bot.send_message(
+        # Note: bot.send_message is generally better in handlers for replies outside of update context
+        await context.bot.send_message( # Used context.bot instead of update.bot for standard usage
             chat_id=update.effective_chat.id,
-            text=f"@{username}, Submission window closed. Morning: 5-9 AM, Night: 9-11 PM."
+            text=f"@{username}, Submission window closed. Morning: 5-9 AM, Night: 9-11 PM.",
+            message_thread_id=THREAD_ID if THREAD_ID else None # Added thread ID support here too
         )
 
 # ------------------------
@@ -386,6 +395,10 @@ async def send_leaderboard_job():
     global telegram_bot_app
     if not telegram_bot_app:
         logging.info("Bot app not ready — skipping leaderboard job.")
+        return
+
+    if not GROUP_CHAT_ID: # Safety check
+        logging.error("GROUP_CHAT_ID not set. Cannot send leaderboard.")
         return
 
     members = get_all_members()
@@ -434,6 +447,10 @@ async def nightly_process_job():
     if not telegram_bot_app:
         logging.info("Bot not ready — skipping nightly_process_job.")
         return
+    
+    if not GROUP_CHAT_ID: # Safety check
+        logging.error("GROUP_CHAT_ID not set. Cannot run nightly process.")
+        return
 
     # Apply missed deductions & reset streak for missed users
     missed_list, updated = apply_missed_deductions_and_reset()
@@ -455,6 +472,11 @@ async def reset_daily_status_job():
     if not telegram_bot_app:
         logging.info("Bot not ready — skipping reset job.")
         return
+        
+    if not GROUP_CHAT_ID: # Safety check
+        logging.error("GROUP_CHAT_ID not set. Cannot send daily reset message.")
+        return
+
     conn = get_db_connection()
     if conn is None:
         return
@@ -478,6 +500,11 @@ async def evening_reminder_job():
     if not telegram_bot_app:
         logging.info("Bot not ready — skipping reminder job.")
         return
+    
+    if not GROUP_CHAT_ID: # Safety check
+        logging.error("GROUP_CHAT_ID not set. Cannot send reminder.")
+        return
+
     members = get_all_members()
     pending = [f"@{m['username']}" for m in members if m['submission_status'] != 'Completed']
     if pending:
@@ -494,13 +521,19 @@ def main():
     global telegram_bot_app
 
     if not BOT_TOKEN or not DATABASE_URL or GROUP_CHAT_ID is None:
-        logging.error("Missing required environment variables. Exiting.")
+        logging.error("Missing required environment variables (BOT_TOKEN, DATABASE_URL, GROUP_ID). Exiting.")
+        return
+
+    # Check for Webhook Config required for Render Web Service
+    if not WEBHOOK_URL:
+        logging.error("Missing WEBHOOK_URL environment variable (required for Webhook mode on Render). Exiting.")
         return
 
     # DB setup
     setup_database()
 
     # Application setup
+    # Note: run_webhook automatically sets the necessary updates
     application = Application.builder().token(BOT_TOKEN).build()
     telegram_bot_app = application  # set global for jobs
 
@@ -510,25 +543,32 @@ def main():
     application.add_handler(CommandHandler("done", done_command))
     application.add_handler(MessageHandler(filters.PHOTO & filters.Chat(GROUP_CHAT_ID), handle_photo_message))
 
-    # Scheduler (BackgroundScheduler). We'll schedule wrappers that create asyncio tasks for coroutines.
-    scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+    # Scheduler (AsyncIOScheduler) - needed because run_webhook uses asyncio
+    scheduler = AsyncIOScheduler(timezone=IST) # Use IST timezone for cron jobs
 
     # 1) Evening reminder: 21:30 IST
-    scheduler.add_job(lambda: asyncio.create_task(evening_reminder_job()), "cron", hour=21, minute=30, id="evening_reminder")
+    scheduler.add_job(evening_reminder_job, "cron", hour=21, minute=30, id="evening_reminder")
 
-    # 2) Leaderboard job: 23:01 IST - first apply deductions & then send leaderboard (we'll use a wrapper)
-    # We'll run the nightly process at 23:01 (apply deductions + send leaderboard)
-    scheduler.add_job(lambda: asyncio.create_task(nightly_process_job()), "cron", hour=23, minute=1, id="nightly_process")
+    # 2) Nightly process (deduction + leaderboard): 23:01 IST
+    scheduler.add_job(nightly_process_job, "cron", hour=23, minute=1, id="nightly_process")
 
     # 3) Daily reset at 00:00 IST
-    scheduler.add_job(lambda: asyncio.create_task(reset_daily_status_job()), "cron", hour=0, minute=0, id="daily_reset")
+    scheduler.add_job(reset_daily_status_job, "cron", hour=0, minute=0, id="daily_reset")
 
     scheduler.start()
-    logging.info("Scheduler started with jobs: evening_reminder (21:30), nightly_process (23:01), daily_reset (00:00).")
+    logging.info("Scheduler (AsyncIOScheduler) started with jobs: evening_reminder (21:30), nightly_process (23:01), daily_reset (00:00).")
 
-    # Run bot (polling). stop_signals=None recommended for containerized environments on Render.
-    logging.info("Bot starting polling...")
-    application.run_polling(poll_interval=1.0, stop_signals=None)
+    # Run bot in Webhook mode, binding to the port specified by Render
+    logging.info(f"Bot starting Webhook on port {PORT} with URL {WEBHOOK_URL}...")
+    
+    # run_webhook binds the service to the required port, fixing the Render error.
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,
+        webhook_url=WEBHOOK_URL + WEBHOOK_PATH,
+        drop_pending_updates=True
+    )
 
 if __name__ == "__main__":
     main()
